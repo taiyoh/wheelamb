@@ -91,7 +91,7 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 	if _, ok := availableTags[*input.Runtime]; !ok {
 		return nil, awserr.New(lambda.ErrCodeInvalidRuntimeException, "invalid runtime", nil)
 	}
-	if input.Code == nil || input.Code.ZipFile == nil {
+	if input.Code.ZipFile == nil {
 		return nil, awserr.New(lambda.ErrCodeInvalidZipFileException, "requires zipfile", nil)
 	}
 	name := *input.FunctionName
