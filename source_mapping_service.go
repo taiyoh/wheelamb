@@ -9,7 +9,7 @@ import (
 
 // SourceMappingService provides interfaces for operating EventSourceMapping for lambda.
 type SourceMappingService struct {
-	registry *lambdaRegistry
+	registry *LambdaRegistry
 	session  *session.Session
 }
 

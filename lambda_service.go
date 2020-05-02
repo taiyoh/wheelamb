@@ -24,12 +24,12 @@ import (
 type LambdaService struct {
 	docker   docker.Docker
 	dir      string
-	registry *lambdaRegistry
+	registry *LambdaRegistry
 	session  *session.Session
 }
 
 // NewLambdaService returns LambdaService object.
-func NewLambdaService(docker docker.Docker, dir string, r *lambdaRegistry) *LambdaService {
+func NewLambdaService(docker docker.Docker, dir string, r *LambdaRegistry) *LambdaService {
 	return &LambdaService{
 		dir:      dir,
 		docker:   docker,
@@ -40,8 +40,8 @@ func NewLambdaService(docker docker.Docker, dir string, r *lambdaRegistry) *Lamb
 
 // Close closes all lambda function containers.
 func (s *LambdaService) Close() error {
-	ids := make([]string, 0, len(s.pool))
-	for _, lf := range s.pool {
+	ids := make([]string, 0, len(s.registry.mapping))
+	for _, lf := range s.registry.mapping {
 		ids = append(ids, lf.inspect.ID)
 	}
 	return s.docker.KillMulti(context.Background(), ids)

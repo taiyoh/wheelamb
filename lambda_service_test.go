@@ -103,7 +103,8 @@ func TestServiceCreate(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	svc := NewLambdaService(&dockerGatewayMock{"foobar"}, dir)
+	reg := NewLambdaRegistry()
+	svc := NewLambdaService(&dockerGatewayMock{"foobar"}, dir, reg)
 	codeZipped, _ := ioutil.ReadFile(filepath.Join("testdata", "fake.zip"))
 	for _, tt := range []struct {
 		label       string
@@ -177,8 +178,8 @@ func TestServiceCreate(t *testing.T) {
 	}
 
 	t.Run("success", func(t *testing.T) {
-		if len(svc.pool) > 0 {
-			t.Errorf("pool should be empty: %#v", svc.pool)
+		if len(reg.mapping) > 0 {
+			t.Errorf("pool should be empty: %#v", reg.mapping)
 		}
 		fn, err := svc.Create(context.Background(), &lambda.CreateFunctionInput{
 			Code: &lambda.FunctionCode{
@@ -209,7 +210,7 @@ func TestServiceCreate(t *testing.T) {
 		if size := info.Size(); size != 2076385 {
 			t.Errorf("size: %d != 2076385", size)
 		}
-		val, ok := svc.pool["mytest"]
+		val, ok := reg.mapping["mytest"]
 		if !ok {
 			t.Error("mytest not registered")
 		}

@@ -66,15 +66,25 @@ var availableTags = map[string]struct{}{
 	// "build-provided":      struct{}{},
 }
 
-type lambdaRegistry struct {
+// LambdaRegistry holds lambda function settings in memory.
+type LambdaRegistry struct {
 	mapping map[string]*LambdaFunction
 }
 
-func (r *lambdaRegistry) Get(name string) *LambdaFunction {
+// NewLambdaRegistry returns LambdaRegistry object.
+func NewLambdaRegistry() *LambdaRegistry {
+	return &LambdaRegistry{
+		mapping: make(map[string]*LambdaFunction),
+	}
+}
+
+// Get returns LambdaFucntion object from given name.
+func (r *LambdaRegistry) Get(name string) *LambdaFunction {
 	return r.mapping[name]
 }
 
-func (r *lambdaRegistry) GetFromARN(arn string) *LambdaFunction {
+// GetFromARN returns LambdaFunction object from given function arn.
+func (r *LambdaRegistry) GetFromARN(arn string) *LambdaFunction {
 	// arn:aws:lambda:%s:000000000000:function:%s
 	parts := strings.Split(arn, ":")
 	for i, p := range []string{"arn", "aws", "lambda", *awsConf.Region, "000000000000", "function"} {
@@ -85,6 +95,7 @@ func (r *lambdaRegistry) GetFromARN(arn string) *LambdaFunction {
 	return r.mapping[parts[6]]
 }
 
-func (r *lambdaRegistry) Register(lf *LambdaFunction) {
+// Register sets LambdaFunction into registry.
+func (r *LambdaRegistry) Register(lf *LambdaFunction) {
 	r.mapping[lf.FunctionName] = lf
 }
