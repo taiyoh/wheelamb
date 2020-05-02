@@ -1,6 +1,7 @@
 package wheelamb
 
 import (
+	"strings"
 	"time"
 
 	"github.com/taiyoh/wheelamb/docker"
@@ -63,4 +64,27 @@ var availableTags = map[string]struct{}{
 	// "build-dotnetcore2.1": struct{}{},
 	// "build-dotnetcore3.1": struct{}{},
 	// "build-provided":      struct{}{},
+}
+
+type lambdaRegistry struct {
+	mapping map[string]*LambdaFunction
+}
+
+func (r *lambdaRegistry) Get(name string) *LambdaFunction {
+	return r.mapping[name]
+}
+
+func (r *lambdaRegistry) GetFromARN(arn string) *LambdaFunction {
+	// arn:aws:lambda:%s:000000000000:function:%s
+	parts := strings.Split(arn, ":")
+	for i, p := range []string{"arn", "aws", "lambda", *awsConf.Region, "000000000000", "function"} {
+		if parts[i] != p {
+			return nil
+		}
+	}
+	return r.mapping[parts[6]]
+}
+
+func (r *lambdaRegistry) Register(lf *LambdaFunction) {
+	r.mapping[lf.FunctionName] = lf
 }

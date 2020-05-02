@@ -22,19 +22,19 @@ import (
 
 // LambdaService provides interfaces for operationg lambda functions.
 type LambdaService struct {
-	docker  docker.Docker
-	dir     string
-	pool    map[string]*LambdaFunction
-	session *session.Session
+	docker   docker.Docker
+	dir      string
+	registry *lambdaRegistry
+	session  *session.Session
 }
 
 // NewLambdaService returns LambdaService object.
-func NewLambdaService(docker docker.Docker, dir string) *LambdaService {
+func NewLambdaService(docker docker.Docker, dir string, r *lambdaRegistry) *LambdaService {
 	return &LambdaService{
-		dir:     dir,
-		docker:  docker,
-		pool:    map[string]*LambdaFunction{},
-		session: session.Must(session.NewSession(awsConf)),
+		dir:      dir,
+		docker:   docker,
+		registry: r,
+		session:  session.Must(session.NewSession(awsConf)),
 	}
 }
 
@@ -152,13 +152,13 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 		envs:         envs,
 		inspect:      inspect,
 	}
-	s.pool[name] = lf
+	s.registry.Register(lf)
 	return lf, nil
 }
 
 func (s *LambdaService) initCaller(name string) (*lambda.Lambda, error) {
-	lf, ok := s.pool[name]
-	if !ok {
+	lf := s.registry.Get(name)
+	if lf == nil {
 		return nil, awserr.New(lambda.ErrCodeResourceNotFoundException, "function not found", nil)
 	}
 	conf := aws.NewConfig().WithEndpoint(fmt.Sprintf("http://%s", lf.inspect.Addr))
