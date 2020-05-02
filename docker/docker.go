@@ -13,15 +13,34 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 )
 
-const lambciImage = "docker.io/lambci/lambda"
+const (
+	lambciImage    = "docker.io/lambci/lambda"
+	defaultNetwork = "default"
+)
+
+type messageForResponseError struct {
+	Message string `json:"message"`
+}
+
+func (m messageForResponseError) Error() string {
+	return m.Message
+}
+
+func unmarshalErrorMessage(body io.ReadCloser) error {
+	r := messageForResponseError{}
+	if err := json.NewDecoder(body).Decode(&r); err != nil {
+		return err
+	}
+	return r
+}
 
 // Docker represents interface for docker operation in wheelamb.
 type Docker interface {
-	Pull(context.Context, string) error
 	RunImage(context.Context, RunImageConfig) (string, error)
 	KillMulti(context.Context, []string) error
 }
@@ -127,27 +146,77 @@ func NewDockerGateway(host, logLevel, networkName string) (Docker, error) {
 		apiClient: cli,
 		logLevel:  logLevel,
 	}
+
+	networkName, err = gw.DetectNetwork(context.Background(), networkName)
+	if err != nil {
+		return nil, err
+	}
+
+	gw.networkName = networkName
+
 	return gw, nil
 }
 
 type dockerGateway struct {
-	apiClient *apiClient
-	logLevel  string
+	apiClient   *apiClient
+	logLevel    string
+	networkName string
 }
 
-func (d *dockerGateway) HasNetwork(ctx context.Context, name string) error {
+func (d *dockerGateway) inspectNetwork(ctx context.Context, name string) error {
 	resp, err := d.apiClient.DoRequest(ctx, http.MethodGet, "/networks/"+name)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return errors.New("invalid network id")
+		return unmarshalErrorMessage(resp.Body)
 	}
 	return nil
 }
 
-func (d *dockerGateway) Pull(ctx context.Context, tag string) error {
+func (d *dockerGateway) detectNetworkFromContainer(ctx context.Context, name string) (string, error) {
+	resp, err := d.apiClient.DoRequest(ctx, http.MethodGet, fmt.Sprintf("/containers/%s/json", name))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 404:
+		return defaultNetwork, nil
+	case 200:
+	default:
+		return "", unmarshalErrorMessage(resp.Body)
+	}
+	body := struct {
+		HostConfig containerHostConfig
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	return body.HostConfig.NetworkMode, nil
+}
+
+func (d *dockerGateway) DetectNetwork(ctx context.Context, name string) (string, error) {
+	if name != "" && name != defaultNetwork {
+		if err := d.inspectNetwork(ctx, name); err != nil {
+			return "", err
+		}
+	}
+	if name == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return "", err
+		}
+		name, err = d.detectNetworkFromContainer(ctx, hostname)
+		if err != nil {
+			return "", err
+		}
+	}
+	return name, nil
+}
+
+func (d *dockerGateway) pullImage(ctx context.Context, tag string) error {
 	vals := url.Values{}
 	vals.Add("fromImage", lambciImage)
 	vals.Add("tag", tag)
@@ -170,22 +239,22 @@ func (d *dockerGateway) Pull(ctx context.Context, tag string) error {
 	return nil
 }
 
-type createContainerPortBind struct {
+type containerPortBind struct {
 	HostIP   string `json:"HostIp"`
 	HostPort string
 }
 
-type createContainerRestartPolicy struct {
+type containerRestartPolicy struct {
 	Name              string
 	MaximumRetryCount int
 }
 
-type createContainerHostConfig struct {
+type containerHostConfig struct {
 	Binds         []string
-	PortBindings  map[string][]createContainerPortBind
+	PortBindings  map[string][]containerPortBind
 	AutoRemove    bool   // forcely set al true
 	NetworkMode   string // forcely set as "bridge"
-	RestartPolicy createContainerRestartPolicy
+	RestartPolicy containerRestartPolicy
 }
 
 type createContainerConfig struct {
@@ -193,7 +262,7 @@ type createContainerConfig struct {
 	Cmd          []string
 	Image        string
 	ExposedPorts map[string]struct{} `json:",omitempty"` // default: {}
-	HostConfig   createContainerHostConfig
+	HostConfig   containerHostConfig
 }
 
 // RunImageConfig represents parameters to run specified image.
@@ -205,32 +274,35 @@ type RunImageConfig struct {
 	Handler string
 }
 
-func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (string, error) {
-	if err := d.Pull(ctx, params.Tag); err != nil {
-		return "", err
-	}
-
+func (d *dockerGateway) createContainer(ctx context.Context, params RunImageConfig) (string, error) {
 	envList := []string{
 		"DOCKER_LAMBDA_STAY_OPEN=1",
 	}
 	for k, v := range params.Envs {
 		envList = append(envList, k+"="+v)
 	}
-	conf := createContainerConfig{
-		Env:   envList,
-		Image: lambciImage + ":" + params.Tag,
-		Cmd:   []string{params.Handler},
-		ExposedPorts: map[string]struct{}{
+
+	var portBindings map[string][]containerPortBind
+	var exposedPorts map[string]struct{}
+	if d.networkName == defaultNetwork {
+		portBindings = map[string][]containerPortBind{
+			"9001/tcp": {{HostPort: "0"}},
+		}
+		exposedPorts = map[string]struct{}{
 			"9001/tcp": {},
-		},
-		HostConfig: createContainerHostConfig{
-			Binds:       []string{fmt.Sprintf("%s:/var/task:ro,delegated", params.Dir)},
-			NetworkMode: "default",
-			PortBindings: map[string][]createContainerPortBind{
-				"9001/tcp": {{HostPort: "0"}},
-			},
-			AutoRemove: true,
-			RestartPolicy: createContainerRestartPolicy{
+		}
+	}
+	conf := createContainerConfig{
+		Env:          envList,
+		Image:        lambciImage + ":" + params.Tag,
+		Cmd:          []string{params.Handler},
+		ExposedPorts: exposedPorts,
+		HostConfig: containerHostConfig{
+			Binds:        []string{fmt.Sprintf("%s:/var/task:ro,delegated", params.Dir)},
+			NetworkMode:  d.networkName,
+			PortBindings: portBindings,
+			AutoRemove:   true,
+			RestartPolicy: containerRestartPolicy{
 				Name: "no",
 			},
 		},
@@ -243,36 +315,52 @@ func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (st
 	if err != nil {
 		return "", err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", unmarshalErrorMessage(resp.Body)
+	}
 	body := struct {
-		Message  string `json:"message"`
 		ID       string `json:"Id"`
 		Warnings []string
 	}{}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return "", err
 	}
-	resp.Body.Close()
 	// log.Printf("body: %#v", body)
-	if body.Message != "" {
-		return body.ID, fmt.Errorf(body.Message)
-	}
 	if len(body.Warnings) > 0 {
 		return body.ID, fmt.Errorf("warnings: %v", body.Warnings)
 	}
-	resp, err = d.apiClient.DoRequest(ctx, http.MethodPost,
-		fmt.Sprintf("/containers/%s/start", body.ID))
+	return body.ID, nil
+}
+
+func (d *dockerGateway) startContainer(ctx context.Context, contanierID string) error {
+	resp, err := d.apiClient.DoRequest(ctx, http.MethodPost,
+		fmt.Sprintf("/containers/%s/start", contanierID))
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf("failed to start container: %s", b)
+		return unmarshalErrorMessage(resp.Body)
 	}
-	return body.ID, nil
+	return nil
+}
+
+func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (string, error) {
+	if err := d.pullImage(ctx, params.Tag); err != nil {
+		return "", err
+	}
+
+	containerID, err := d.createContainer(ctx, params)
+	if err != nil {
+		return containerID, err
+	}
+
+	if err := d.startContainer(ctx, containerID); err != nil {
+		return containerID, err
+	}
+
+	return containerID, nil
 }
 
 type errList []error
