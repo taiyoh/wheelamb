@@ -77,14 +77,20 @@ func TestPutZippedCode(t *testing.T) {
 	})
 }
 
-type dockerGatewayMock struct{}
+type dockerGatewayMock struct {
+	containerID string
+}
 
 func (dockerGatewayMock) Pull(context.Context, string) error {
 	return nil
 }
 
-func (dockerGatewayMock) RunImage(context.Context, docker.RunImageConfig) (string, error) {
-	return "", nil
+func (m *dockerGatewayMock) RunImage(context.Context, docker.RunImageConfig) (string, error) {
+	return m.containerID, nil
+}
+
+func (m *dockerGatewayMock) KillMulti(context.Context, []string) error {
+	return nil
 }
 
 func TestServiceCreate(t *testing.T) {
@@ -94,7 +100,7 @@ func TestServiceCreate(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	svc := NewLambdaService(&dockerGatewayMock{}, dir)
+	svc := NewLambdaService(&dockerGatewayMock{"foobar"}, dir)
 	codeZipped, _ := ioutil.ReadFile(filepath.Join("testdata", "fake.zip"))
 	for _, tt := range []struct {
 		label       string

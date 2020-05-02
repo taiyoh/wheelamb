@@ -33,6 +33,15 @@ func NewLambdaService(docker docker.Docker, dir string) *LambdaService {
 	}
 }
 
+// Close closes all lambda function containers.
+func (s *LambdaService) Close() error {
+	ids := make([]string, 0, len(s.pool))
+	for _, lf := range s.pool {
+		ids = append(ids, lf.containerID)
+	}
+	return s.docker.KillMulti(context.Background(), ids)
+}
+
 func putZippedCode(d, name string, zippedFile []byte) (size int64, err error) {
 	newDir := filepath.Join(d, name)
 	switch info, err := os.Stat(newDir); {
@@ -89,9 +98,6 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 		for k, v := range input.Environment.Variables {
 			envs[k] = *v
 		}
-	}
-	if err := s.docker.Pull(ctx, *input.Runtime); err != nil {
-		return nil, awserr.New(lambda.ErrCodeServiceException, "failed to pull docker image", err)
 	}
 	containerID, err := s.docker.RunImage(ctx, docker.RunImageConfig{
 		Name:    "wheelamb-" + name,

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 const lambciImage = "docker.io/lambci/lambda"
@@ -22,6 +23,7 @@ const lambciImage = "docker.io/lambci/lambda"
 type Docker interface {
 	Pull(context.Context, string) error
 	RunImage(context.Context, RunImageConfig) (string, error)
+	KillMulti(context.Context, []string) error
 }
 
 type apiClient struct {
@@ -204,6 +206,10 @@ type RunImageConfig struct {
 }
 
 func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (string, error) {
+	if err := d.Pull(ctx, params.Tag); err != nil {
+		return "", err
+	}
+
 	envList := []string{
 		"DOCKER_LAMBDA_STAY_OPEN=1",
 	}
@@ -267,4 +273,51 @@ func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (st
 		return "", fmt.Errorf("failed to start container: %s", b)
 	}
 	return body.ID, nil
+}
+
+type errList []error
+
+func (l errList) Error() string {
+	return fmt.Sprintf("error found: %#v", l)
+}
+
+func (l errList) Errors() []error {
+	return l
+}
+
+func (d *dockerGateway) KillMulti(ctx context.Context, ids []string) error {
+	semaphore := make(chan struct{}, 3)
+	var errs errList
+	wg := &sync.WaitGroup{}
+	for _, id := range ids {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(id string) {
+			defer func() {
+				wg.Done()
+				<-semaphore
+			}()
+			resp, err := d.apiClient.DoRequest(ctx, http.MethodPost,
+				fmt.Sprintf("/containers/%s/kill", id))
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode < 300 {
+				if d.logLevel == "debug" {
+					log.Printf("container:%s closed", id)
+				}
+				return
+			}
+			switch b, err := ioutil.ReadAll(resp.Body); {
+			case err != nil:
+				errs = append(errs, err)
+			default:
+				errs = append(errs, fmt.Errorf("failed to kill container: %s, err: %s", id, b))
+			}
+		}(id)
+	}
+	wg.Wait()
+	return errs
 }
