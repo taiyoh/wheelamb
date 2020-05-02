@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/lambda"
 	"github.com/google/uuid"
 	"github.com/taiyoh/wheelamb/docker"
@@ -20,17 +22,19 @@ import (
 
 // LambdaService provides interfaces for operationg lambda functions.
 type LambdaService struct {
-	docker docker.Docker
-	dir    string
-	pool   map[string]*LambdaFunction
+	docker  docker.Docker
+	dir     string
+	pool    map[string]*LambdaFunction
+	session *session.Session
 }
 
 // NewLambdaService returns LambdaService object.
 func NewLambdaService(docker docker.Docker, dir string) *LambdaService {
 	return &LambdaService{
-		dir:    dir,
-		docker: docker,
-		pool:   map[string]*LambdaFunction{},
+		dir:     dir,
+		docker:  docker,
+		pool:    map[string]*LambdaFunction{},
+		session: session.Must(session.NewSession(awsConf)),
 	}
 }
 
@@ -152,16 +156,29 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 	return lf, nil
 }
 
+func (s *LambdaService) initCaller(name string) (*lambda.Lambda, error) {
+	lf, ok := s.pool[name]
+	if !ok {
+		return nil, awserr.New(lambda.ErrCodeResourceNotFoundException, "function not found", nil)
+	}
+	conf := aws.NewConfig().WithEndpoint(fmt.Sprintf("http://%s", lf.inspect.Addr))
+	return lambda.New(s.session, conf), nil
+}
+
 // InvokeSync invokes lambda function with waiting response.
 func (s *LambdaService) InvokeSync(ctx context.Context, input *lambda.InvokeInput) (*lambda.InvokeOutput, error) {
-	return nil, nil
+	svc, err := s.initCaller(*input.FunctionName)
+	if err != nil {
+		return nil, err
+	}
+	return svc.InvokeWithContext(ctx, input)
 }
 
 // InvokeAsync invokes lambda function without waiting response.
 func (s *LambdaService) InvokeAsync(ctx context.Context, input *lambda.InvokeAsyncInput) (*lambda.InvokeAsyncOutput, error) {
-	return nil, nil
-}
-
-func (s *LambdaService) find(name string) *LambdaFunction {
-	return s.pool[name]
+	svc, err := s.initCaller(*input.FunctionName)
+	if err != nil {
+		return nil, err
+	}
+	return svc.InvokeAsyncWithContext(ctx, input)
 }
