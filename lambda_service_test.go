@@ -85,8 +85,11 @@ func (dockerGatewayMock) Pull(context.Context, string) error {
 	return nil
 }
 
-func (m *dockerGatewayMock) RunImage(context.Context, docker.RunImageConfig) (string, error) {
-	return m.containerID, nil
+func (m *dockerGatewayMock) RunImage(context.Context, docker.RunImageConfig) (*docker.ContainerInspect, error) {
+	return &docker.ContainerInspect{
+		ID:   m.containerID,
+		Addr: "myfunc:9001",
+	}, nil
 }
 
 func (m *dockerGatewayMock) KillMulti(context.Context, []string) error {
@@ -199,12 +202,12 @@ func TestServiceCreate(t *testing.T) {
 		if fn == nil {
 			t.Error("lambdaFunction should exists")
 		}
-		info, err := os.Stat(filepath.Join(svc.dir, "mytest", "code.zip"))
+		info, err := os.Stat(filepath.Join(svc.dir, "mytest", "fake"))
 		if err != nil {
 			t.Errorf("caught error: %v", err)
 		}
-		if size := info.Size(); size != 1097735 {
-			t.Errorf("size: %d != 1097735", size)
+		if size := info.Size(); size != 2076385 {
+			t.Errorf("size: %d != 2076385", size)
 		}
 		val, ok := svc.pool["mytest"]
 		if !ok {

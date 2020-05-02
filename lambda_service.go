@@ -1,12 +1,13 @@
 package wheelamb
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -37,7 +38,7 @@ func NewLambdaService(docker docker.Docker, dir string) *LambdaService {
 func (s *LambdaService) Close() error {
 	ids := make([]string, 0, len(s.pool))
 	for _, lf := range s.pool {
-		ids = append(ids, lf.containerID)
+		ids = append(ids, lf.inspect.ID)
 	}
 	return s.docker.KillMulti(context.Background(), ids)
 }
@@ -65,16 +66,37 @@ func putZippedCode(d, name string, zippedFile []byte) (size int64, err error) {
 		err = awserr.New(lambda.ErrCodeInvalidZipFileException, "unable to decode from base64", err)
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(newDir, "code.zip"), os.O_CREATE|os.O_RDWR, 0755)
+	zreader := bytes.NewReader(zipped)
+	zr, err := zip.NewReader(zreader, zreader.Size())
 	if err != nil {
-		err = awserr.New(lambda.ErrCodeServiceException, "failed to put zipfile", err)
+		err = awserr.New(lambda.ErrCodeInvalidZipFileException, "unable to read zip code", err)
 		return
 	}
-	size, err = io.Copy(f, bytes.NewReader(zipped))
-	if err != nil {
-		err = awserr.New(lambda.ErrCodeServiceException, "failed to put zipfile", err)
+	for _, f := range zr.File {
+		if err = putZippedFile(f, newDir); err != nil {
+			err = awserr.New(lambda.ErrCodeInvalidZipFileException, "unable to read zip code", err)
+			return
+		}
 	}
+	size = zreader.Size()
 	return
+}
+
+func putZippedFile(f *zip.File, dest string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	fileName := filepath.Join(dest, f.Name)
+	if f.FileInfo().IsDir() {
+		return os.MkdirAll(fileName, f.Mode())
+	}
+	r := bytes.NewBuffer([]byte{})
+	if _, err := r.ReadFrom(rc); err != nil {
+		return err
+	}
+	return ioutil.WriteFile(fileName, r.Bytes(), f.Mode())
 }
 
 // Create creates new lambda function.
@@ -99,7 +121,7 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 			envs[k] = *v
 		}
 	}
-	containerID, err := s.docker.RunImage(ctx, docker.RunImageConfig{
+	inspect, err := s.docker.RunImage(ctx, docker.RunImageConfig{
 		Name:    "wheelamb-" + name,
 		Dir:     filepath.Join(s.dir, name),
 		Tag:     *input.Runtime,
@@ -124,7 +146,7 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 		Description:  input.Description,
 		CodeSize:     size,
 		envs:         envs,
-		containerID:  containerID,
+		inspect:      inspect,
 	}
 	s.pool[name] = lf
 	return lf, nil

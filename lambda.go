@@ -1,6 +1,10 @@
 package wheelamb
 
-import "time"
+import (
+	"time"
+
+	"github.com/taiyoh/wheelamb/docker"
+)
 
 // LambdaFunction describes lambda function settings.
 // via https://docs.aws.amazon.com/cli/latest/reference/lambda/create-function.html
@@ -18,7 +22,7 @@ type LambdaFunction struct {
 	Runtime      string
 	Description  *string
 	envs         map[string]string
-	containerID  string
+	inspect      *docker.ContainerInspect
 }
 
 // https://github.com/lambci/docker-lambda#docker-tags

@@ -41,7 +41,7 @@ func unmarshalErrorMessage(body io.ReadCloser) error {
 
 // Docker represents interface for docker operation in wheelamb.
 type Docker interface {
-	RunImage(context.Context, RunImageConfig) (string, error)
+	RunImage(context.Context, RunImageConfig) (*ContainerInspect, error)
 	KillMulti(context.Context, []string) error
 }
 
@@ -175,26 +175,28 @@ func (d *dockerGateway) inspectNetwork(ctx context.Context, name string) error {
 	return nil
 }
 
-func (d *dockerGateway) detectNetworkFromContainer(ctx context.Context, name string) (string, error) {
+func (d *dockerGateway) inspectHostConfigFromContainer(ctx context.Context, name string) (*containerHostConfig, error) {
 	resp, err := d.apiClient.DoRequest(ctx, http.MethodGet, fmt.Sprintf("/containers/%s/json", name))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case 404:
-		return defaultNetwork, nil
+		return &containerHostConfig{
+			NetworkMode: defaultNetwork,
+		}, nil
 	case 200:
 	default:
-		return "", unmarshalErrorMessage(resp.Body)
+		return nil, unmarshalErrorMessage(resp.Body)
 	}
 	body := struct {
-		HostConfig containerHostConfig
+		HostConfig *containerHostConfig
 	}{}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
+		return nil, err
 	}
-	return body.HostConfig.NetworkMode, nil
+	return body.HostConfig, nil
 }
 
 func (d *dockerGateway) DetectNetwork(ctx context.Context, name string) (string, error) {
@@ -203,17 +205,18 @@ func (d *dockerGateway) DetectNetwork(ctx context.Context, name string) (string,
 			return "", err
 		}
 	}
-	if name == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return "", err
-		}
-		name, err = d.detectNetworkFromContainer(ctx, hostname)
-		if err != nil {
-			return "", err
-		}
+	if name != "" {
+		return name, nil
 	}
-	return name, nil
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	conf, err := d.inspectHostConfigFromContainer(ctx, hostname)
+	if err != nil {
+		return "", err
+	}
+	return conf.NetworkMode, nil
 }
 
 func (d *dockerGateway) pullImage(ctx context.Context, tag string) error {
@@ -346,21 +349,42 @@ func (d *dockerGateway) startContainer(ctx context.Context, contanierID string) 
 	return nil
 }
 
-func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (string, error) {
+type ContainerInspect struct {
+	ID   string
+	Addr string
+}
+
+func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (*ContainerInspect, error) {
 	if err := d.pullImage(ctx, params.Tag); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	containerID, err := d.createContainer(ctx, params)
 	if err != nil {
-		return containerID, err
+		return nil, err
 	}
 
 	if err := d.startContainer(ctx, containerID); err != nil {
-		return containerID, err
+		return nil, err
 	}
 
-	return containerID, nil
+	if d.networkName != defaultNetwork {
+		return &ContainerInspect{
+			ID:   containerID,
+			Addr: fmt.Sprintf("%s:9001", params.Name),
+		}, nil
+	}
+
+	hostConf, err := d.inspectHostConfigFromContainer(ctx, containerID)
+	if err != nil {
+		return nil, err
+	}
+
+	portBind := hostConf.PortBindings["9001/tcp"][0]
+	return &ContainerInspect{
+		ID:   containerID,
+		Addr: fmt.Sprintf("%s:%s", portBind.HostIP, portBind.HostPort),
+	}, nil
 }
 
 type errList []error
