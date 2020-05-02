@@ -18,6 +18,7 @@ type LambdaFunction struct {
 	Runtime      string
 	Description  *string
 	envs         map[string]string
+	containerID  string
 }
 
 // https://github.com/lambci/docker-lambda#docker-tags

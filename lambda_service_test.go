@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/lambda"
+	"github.com/taiyoh/wheelamb/docker"
 )
 
 func TestPutZippedCode(t *testing.T) {
@@ -76,10 +77,24 @@ func TestPutZippedCode(t *testing.T) {
 	})
 }
 
+type dockerGatewayMock struct{}
+
+func (dockerGatewayMock) Pull(context.Context, string) error {
+	return nil
+}
+
+func (dockerGatewayMock) RunImage(context.Context, docker.RunImageConfig) (string, error) {
+	return "", nil
+}
+
 func TestServiceCreate(t *testing.T) {
-	dir, _ := ioutil.TempDir("", "")
-	svc := LambdaService{dir: dir, pool: map[string]*LambdaFunction{}}
-	t.Cleanup(func() { svc.Close() })
+	dir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	svc := NewLambdaService(&dockerGatewayMock{}, dir)
 	codeZipped, _ := ioutil.ReadFile(filepath.Join("testdata", "fake.zip"))
 	for _, tt := range []struct {
 		label       string
@@ -178,7 +193,7 @@ func TestServiceCreate(t *testing.T) {
 		if fn == nil {
 			t.Error("lambdaFunction should exists")
 		}
-		info, err := os.Stat(filepath.Join(dir, "mytest", "code.zip"))
+		info, err := os.Stat(filepath.Join(svc.dir, "mytest", "code.zip"))
 		if err != nil {
 			t.Errorf("caught error: %v", err)
 		}

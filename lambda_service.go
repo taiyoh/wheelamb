@@ -7,45 +7,30 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/lambda"
-	"github.com/docker/docker/api/types"
 	"github.com/google/uuid"
-	"github.com/moby/moby/client"
+	"github.com/taiyoh/wheelamb/docker"
 )
 
 // LambdaService provides interfaces for operationg lambda functions.
 type LambdaService struct {
-	cli  *client.Client
-	dir  string
-	pool map[string]*LambdaFunction
+	docker docker.Docker
+	dir    string
+	pool   map[string]*LambdaFunction
 }
 
 // NewLambdaService returns LambdaService object.
-func NewLambdaService(dockerHost, dockerVersion string) (*LambdaService, error) {
-	cli, err := client.NewClient(dockerHost, dockerVersion, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		return nil, err
-	}
+func NewLambdaService(docker docker.Docker, dir string) *LambdaService {
 	return &LambdaService{
-		cli:  cli,
-		dir:  dir,
-		pool: map[string]*LambdaFunction{},
-	}, nil
-}
-
-// Close remove temporary directory for code storage.
-func (s *LambdaService) Close() {
-	os.RemoveAll(s.dir) // clean up
+		dir:    dir,
+		docker: docker,
+		pool:   map[string]*LambdaFunction{},
+	}
 }
 
 func putZippedCode(d, name string, zippedFile []byte) (size int64, err error) {
@@ -105,6 +90,19 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 			envs[k] = *v
 		}
 	}
+	if err := s.docker.Pull(ctx, *input.Runtime); err != nil {
+		return nil, awserr.New(lambda.ErrCodeServiceException, "failed to pull docker image", err)
+	}
+	containerID, err := s.docker.RunImage(ctx, docker.RunImageConfig{
+		Name:    "wheelamb-" + name,
+		Dir:     filepath.Join(s.dir, name),
+		Tag:     *input.Runtime,
+		Handler: *input.Handler,
+		Envs:    envs,
+	})
+	if err != nil {
+		return nil, awserr.New(lambda.ErrCodeServiceException, "failed to start container", err)
+	}
 	sha256Sum := sha256.Sum256(input.Code.ZipFile)
 	lf := &LambdaFunction{
 		RevisionID:   uuid.New().String(),
@@ -120,13 +118,10 @@ func (s *LambdaService) Create(ctx context.Context, input *lambda.CreateFunction
 		Description:  input.Description,
 		CodeSize:     size,
 		envs:         envs,
+		containerID:  containerID,
 	}
 	s.pool[name] = lf
 	return lf, nil
-}
-
-func invokeFunction(ctx context.Context, cli *client.Client) {
-	cli.ContainerStart(ctx, "", types.ContainerStartOptions{})
 }
 
 // InvokeSync invokes lambda function with waiting response.
