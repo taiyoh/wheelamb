@@ -20,8 +20,19 @@ import (
 
 const (
 	lambciImage    = "docker.io/lambci/lambda"
-	defaultNetwork = "default"
+	defaultNetwork = "wheelamb_default"
 )
+
+type logger struct {
+	level string
+}
+
+func (l *logger) Debug(msg string, args ...interface{}) {
+	if l.level != "debug" {
+		return
+	}
+	log.Printf(msg, args...)
+}
 
 type messageForResponseError struct {
 	Message string `json:"message"`
@@ -39,6 +50,11 @@ func unmarshalErrorMessage(body io.ReadCloser) error {
 	return r
 }
 
+type idResponse struct {
+	ID       string `json:"Id"`
+	Warnings []string
+}
+
 // Docker represents interface for docker operation in wheelamb.
 type Docker interface {
 	RunImage(context.Context, RunImageConfig) (*ContainerInspect, error)
@@ -47,6 +63,7 @@ type Docker interface {
 
 type apiClient struct {
 	basePath   string
+	logger     *logger
 	httpClient *http.Client
 }
 
@@ -66,7 +83,7 @@ func (r *apiRequest) buildURL() string {
 	return r.url
 }
 
-func (r *apiRequest) buildBody() io.Reader {
+func (r *apiRequest) buildBody() *bytes.Buffer {
 	if r.body == nil {
 		return nil
 	}
@@ -74,7 +91,6 @@ func (r *apiRequest) buildBody() io.Reader {
 	if err != nil {
 		return nil
 	}
-	// log.Printf("body: %s", b)
 	return bytes.NewBuffer(b)
 }
 
@@ -100,7 +116,10 @@ func (c *apiClient) DoRequest(ctx context.Context, method, path string, fns ...a
 		fn(r)
 	}
 	reqBody := r.buildBody()
-	req, err := http.NewRequestWithContext(ctx, method, r.buildURL(), reqBody)
+	url := r.buildURL()
+	c.logger.Debug("[%s] %s", method, url)
+	c.logger.Debug(">>  body: %s", reqBody.String())
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if reqBody != nil {
 		req.Header.Add("Content-Type", "application/json")
 	}
@@ -110,7 +129,7 @@ func (c *apiClient) DoRequest(ctx context.Context, method, path string, fns ...a
 	return c.httpClient.Do(req)
 }
 
-func newClient(host string) (*apiClient, error) {
+func newClient(host string, logger *logger) (*apiClient, error) {
 	basePath := "http://localhost/v1.40"
 	var tr http.RoundTripper
 	switch strs := strings.Split(host, "://"); strs[0] {
@@ -129,6 +148,7 @@ func newClient(host string) (*apiClient, error) {
 	}
 	return &apiClient{
 		basePath: basePath,
+		logger:   logger,
 		httpClient: &http.Client{
 			Transport: tr,
 		},
@@ -137,19 +157,28 @@ func newClient(host string) (*apiClient, error) {
 
 // NewDockerGateway returns Docker operation implementation.
 func NewDockerGateway(host, logLevel, networkName string) (Docker, error) {
-	cli, err := newClient(host)
+	l := &logger{
+		level: logLevel,
+	}
+	cli, err := newClient(host, l)
 	if err != nil {
 		return nil, err
 	}
 
 	gw := &dockerGateway{
 		apiClient: cli,
-		logLevel:  logLevel,
+		logger:    l,
 	}
 
 	networkName, err = gw.DetectNetwork(context.Background(), networkName)
 	if err != nil {
 		return nil, err
+	}
+	if networkName == "" {
+		if err := gw.createDefaultNetwork(context.Background()); err != nil {
+			return nil, err
+		}
+		networkName = defaultNetwork
 	}
 
 	gw.networkName = networkName
@@ -159,7 +188,7 @@ func NewDockerGateway(host, logLevel, networkName string) (Docker, error) {
 
 type dockerGateway struct {
 	apiClient   *apiClient
-	logLevel    string
+	logger      *logger
 	networkName string
 }
 
@@ -175,6 +204,19 @@ func (d *dockerGateway) inspectNetwork(ctx context.Context, name string) error {
 	return nil
 }
 
+func (d *dockerGateway) createDefaultNetwork(ctx context.Context) error {
+	body := map[string]string{"Name": defaultNetwork}
+	resp, err := d.apiClient.DoRequest(ctx, http.MethodPost, "/networks/create", requestBody(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return unmarshalErrorMessage(resp.Body)
+	}
+	return nil
+}
+
 func (d *dockerGateway) inspectHostConfigFromContainer(ctx context.Context, name string) (*containerHostConfig, error) {
 	resp, err := d.apiClient.DoRequest(ctx, http.MethodGet, fmt.Sprintf("/containers/%s/json", name))
 	if err != nil {
@@ -183,9 +225,7 @@ func (d *dockerGateway) inspectHostConfigFromContainer(ctx context.Context, name
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case 404:
-		return &containerHostConfig{
-			NetworkMode: defaultNetwork,
-		}, nil
+		return &containerHostConfig{NetworkMode: ""}, nil
 	case 200:
 	default:
 		return nil, unmarshalErrorMessage(resp.Body)
@@ -234,10 +274,7 @@ func (d *dockerGateway) pullImage(ctx context.Context, tag string) error {
 		if err == io.EOF {
 			break
 		}
-		line = bytes.Trim(line, "\r")
-		if d.logLevel == "debug" {
-			log.Print(string(line)) // TODO
-		}
+		d.logger.Debug(string(bytes.Trim(line, "\r")))
 	}
 	return nil
 }
@@ -254,18 +291,28 @@ type containerRestartPolicy struct {
 
 type containerHostConfig struct {
 	Binds         []string
-	PortBindings  map[string][]containerPortBind
-	AutoRemove    bool   // forcely set al true
-	NetworkMode   string // forcely set as "bridge"
+	Links         []string                       `json:",omitempty"`
+	PortBindings  map[string][]containerPortBind `json:",omitempty"`
+	AutoRemove    bool                           // forcely set al true
+	NetworkMode   string                         // forcely set as "bridge"
 	RestartPolicy containerRestartPolicy
 }
 
+type containerNetworkConfig struct {
+	EndpointsConfig map[string]containerEndpointsConfig
+}
+
+type containerEndpointsConfig struct {
+	Aliases []string
+}
+
 type createContainerConfig struct {
-	Env          []string
-	Cmd          []string
-	Image        string
-	ExposedPorts map[string]struct{} `json:",omitempty"` // default: {}
-	HostConfig   containerHostConfig
+	Env              []string
+	Cmd              []string
+	Image            string
+	ExposedPorts     map[string]struct{} `json:",omitempty"` // default: {}
+	HostConfig       containerHostConfig
+	NetworkingConfig containerNetworkConfig
 }
 
 // RunImageConfig represents parameters to run specified image.
@@ -285,28 +332,23 @@ func (d *dockerGateway) createContainer(ctx context.Context, params RunImageConf
 		envList = append(envList, k+"="+v)
 	}
 
-	var portBindings map[string][]containerPortBind
-	var exposedPorts map[string]struct{}
-	if d.networkName == defaultNetwork {
-		portBindings = map[string][]containerPortBind{
-			"9001/tcp": {{HostPort: "0"}},
-		}
-		exposedPorts = map[string]struct{}{
-			"9001/tcp": {},
-		}
-	}
 	conf := createContainerConfig{
-		Env:          envList,
-		Image:        lambciImage + ":" + params.Tag,
-		Cmd:          []string{params.Handler},
-		ExposedPorts: exposedPorts,
+		Env:   envList,
+		Image: lambciImage + ":" + params.Tag,
+		Cmd:   []string{params.Handler},
 		HostConfig: containerHostConfig{
-			Binds:        []string{fmt.Sprintf("%s:/var/task:ro,delegated", params.Dir)},
-			NetworkMode:  d.networkName,
-			PortBindings: portBindings,
-			AutoRemove:   true,
+			Binds:       []string{params.Dir + ":/var/task:ro,delegated"},
+			NetworkMode: d.networkName,
+			AutoRemove:  true,
 			RestartPolicy: containerRestartPolicy{
 				Name: "no",
+			},
+		},
+		NetworkingConfig: containerNetworkConfig{
+			EndpointsConfig: map[string]containerEndpointsConfig{
+				d.networkName: {
+					Aliases: []string{params.Name},
+				},
 			},
 		},
 	}
@@ -322,10 +364,7 @@ func (d *dockerGateway) createContainer(ctx context.Context, params RunImageConf
 	if resp.StatusCode >= 300 {
 		return "", unmarshalErrorMessage(resp.Body)
 	}
-	body := struct {
-		ID       string `json:"Id"`
-		Warnings []string
-	}{}
+	body := idResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return "", err
 	}
@@ -349,6 +388,7 @@ func (d *dockerGateway) startContainer(ctx context.Context, contanierID string) 
 	return nil
 }
 
+// ContainerInspect represents container information.
 type ContainerInspect struct {
 	ID   string
 	Addr string
@@ -417,9 +457,7 @@ func (d *dockerGateway) KillMulti(ctx context.Context, ids []string) error {
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode < 300 {
-				if d.logLevel == "debug" {
-					log.Printf("container:%s closed", id)
-				}
+				d.logger.Debug("container:%s closed", id)
 				return
 			}
 			switch b, err := ioutil.ReadAll(resp.Body); {
