@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -115,12 +116,16 @@ func (c *apiClient) DoRequest(ctx context.Context, method, path string, fns ...a
 	for _, fn := range fns {
 		fn(r)
 	}
-	reqBody := r.buildBody()
+
 	url := r.buildURL()
 	c.logger.Debug("[%s] %s", method, url)
-	c.logger.Debug(">>  body: %s", reqBody.String())
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
-	if reqBody != nil {
+	var rb io.Reader
+	if reqBody := r.buildBody(); reqBody != nil {
+		rb = reqBody
+		c.logger.Debug(">>  body: %s", reqBody.String())
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, rb)
+	if rb != nil {
 		req.Header.Add("Content-Type", "application/json")
 	}
 	if err != nil {
@@ -156,7 +161,7 @@ func newClient(host string, logger *logger) (*apiClient, error) {
 }
 
 // NewDockerGateway returns Docker operation implementation.
-func NewDockerGateway(host, logLevel, networkName string) (Docker, error) {
+func NewDockerGateway(host, logLevel string) (Docker, error) {
 	l := &logger{
 		level: logLevel,
 	}
@@ -170,18 +175,21 @@ func NewDockerGateway(host, logLevel, networkName string) (Docker, error) {
 		logger:    l,
 	}
 
-	networkName, err = gw.DetectNetwork(context.Background(), networkName)
+	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, err
 	}
-	if networkName == "" {
-		if err := gw.createDefaultNetwork(context.Background()); err != nil {
-			return nil, err
-		}
-		networkName = defaultNetwork
+	conf, err := gw.inspectHostConfigFromContainer(context.Background(), hostname)
+	if err != nil {
+		return nil, err
 	}
 
-	gw.networkName = networkName
+	gw.networkName = conf.NetworkMode
+	for _, m := range conf.Mounts {
+		if m.Type == "volume" && m.Destination == "/var/task" {
+			gw.volume = m.Name
+		}
+	}
 
 	return gw, nil
 }
@@ -190,31 +198,7 @@ type dockerGateway struct {
 	apiClient   *apiClient
 	logger      *logger
 	networkName string
-}
-
-func (d *dockerGateway) inspectNetwork(ctx context.Context, name string) error {
-	resp, err := d.apiClient.DoRequest(ctx, http.MethodGet, "/networks/"+name)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return unmarshalErrorMessage(resp.Body)
-	}
-	return nil
-}
-
-func (d *dockerGateway) createDefaultNetwork(ctx context.Context) error {
-	body := map[string]string{"Name": defaultNetwork}
-	resp, err := d.apiClient.DoRequest(ctx, http.MethodPost, "/networks/create", requestBody(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return unmarshalErrorMessage(resp.Body)
-	}
-	return nil
+	volume      string
 }
 
 func (d *dockerGateway) inspectHostConfigFromContainer(ctx context.Context, name string) (*containerHostConfig, error) {
@@ -232,31 +216,13 @@ func (d *dockerGateway) inspectHostConfigFromContainer(ctx context.Context, name
 	}
 	body := struct {
 		HostConfig *containerHostConfig
+		Mounts     []*containerMount
 	}{}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, err
 	}
+	body.HostConfig.Mounts = body.Mounts
 	return body.HostConfig, nil
-}
-
-func (d *dockerGateway) DetectNetwork(ctx context.Context, name string) (string, error) {
-	if name != "" && name != defaultNetwork {
-		if err := d.inspectNetwork(ctx, name); err != nil {
-			return "", err
-		}
-	}
-	if name != "" {
-		return name, nil
-	}
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", err
-	}
-	conf, err := d.inspectHostConfigFromContainer(ctx, hostname)
-	if err != nil {
-		return "", err
-	}
-	return conf.NetworkMode, nil
 }
 
 func (d *dockerGateway) pullImage(ctx context.Context, tag string) error {
@@ -296,6 +262,15 @@ type containerHostConfig struct {
 	AutoRemove    bool                           // forcely set al true
 	NetworkMode   string                         // forcely set as "bridge"
 	RestartPolicy containerRestartPolicy
+	Mounts        []*containerMount `json:",omitempty"`
+}
+
+type containerMount struct {
+	Type        string // "bind" "volume" "tmpfs" "npipe"
+	Name        string
+	Source      string
+	Destination string
+	Driver      string
 }
 
 type containerNetworkConfig struct {
@@ -335,9 +310,9 @@ func (d *dockerGateway) createContainer(ctx context.Context, params RunImageConf
 	conf := createContainerConfig{
 		Env:   envList,
 		Image: lambciImage + ":" + params.Tag,
-		Cmd:   []string{params.Handler},
+		Cmd:   []string{filepath.Join(params.Dir, params.Handler)},
 		HostConfig: containerHostConfig{
-			Binds:       []string{params.Dir + ":/var/task:ro,delegated"},
+			Binds:       []string{fmt.Sprintf("%s:/var/task:ro,delegated", d.volume)},
 			NetworkMode: d.networkName,
 			AutoRemove:  true,
 			RestartPolicy: containerRestartPolicy{
@@ -408,22 +383,9 @@ func (d *dockerGateway) RunImage(ctx context.Context, params RunImageConfig) (*C
 		return nil, err
 	}
 
-	if d.networkName != defaultNetwork {
-		return &ContainerInspect{
-			ID:   containerID,
-			Addr: fmt.Sprintf("%s:9001", params.Name),
-		}, nil
-	}
-
-	hostConf, err := d.inspectHostConfigFromContainer(ctx, containerID)
-	if err != nil {
-		return nil, err
-	}
-
-	portBind := hostConf.PortBindings["9001/tcp"][0]
 	return &ContainerInspect{
 		ID:   containerID,
-		Addr: fmt.Sprintf("%s:%s", portBind.HostIP, portBind.HostPort),
+		Addr: fmt.Sprintf("%s:9001", params.Name),
 	}, nil
 }
 
